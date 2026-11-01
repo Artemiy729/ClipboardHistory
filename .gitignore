@@ -1,0 +1,6 @@
+build/
+backups/
+windows/bin/
+windows/obj/
+*.user
+.DS_Store
