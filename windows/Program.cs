@@ -1,6 +1,8 @@
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Diagnostics;
 using Microsoft.Win32;
 
 namespace ClipboardHistory.Windows;
@@ -26,6 +28,9 @@ internal sealed class HotkeySettings
     public uint Modifiers { get; set; } = 0x0002 | 0x0004;
     public int MaxEntries { get; set; } = 500;
     public int MaxMegabytes { get; set; } = 250;
+    public int RetentionHours { get; set; } = 24;
+    public bool RecordingPaused { get; set; }
+    public string ExcludedProcesses { get; set; } = "";
     public string Display => ((Modifiers & 0x0002) != 0 ? "Ctrl+" : "")
         + ((Modifiers & 0x0001) != 0 ? "Alt+" : "")
         + ((Modifiers & 0x0004) != 0 ? "Shift+" : "") + Key;
@@ -49,6 +54,8 @@ internal sealed class ClipboardForm : Form
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public INPUTUNION value; }
@@ -71,6 +78,13 @@ internal sealed class ClipboardForm : Form
     private IntPtr previousWindow;
     private bool quitting;
     private HotkeySettings hotkey = new();
+    private DateTime lastPrune = DateTime.MinValue;
+    private static readonly HashSet<string> PasswordManagers = new(StringComparer.OrdinalIgnoreCase) {
+        "1Password", "Bitwarden", "KeePassXC", "KeePass", "Dashlane", "LastPass"
+    };
+    private static readonly Regex SensitiveContent = new(
+        "-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|(?i:authorization\\s*:\\s*(?:bearer|basic)\\s+\\S+)|\\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\\b|(?im:^\\s*(?:api[_-]?key|client[_-]?secret|password|passwd|access[_-]?token)\\s*[:=]\\s*[\"']?[^\\s\"']{8,})",
+        RegexOptions.Compiled, TimeSpan.FromMilliseconds(100));
 
     public ClipboardForm()
     {
@@ -86,6 +100,8 @@ internal sealed class ClipboardForm : Form
         catch (Exception e) when (e is IOException or JsonException) { hotkey = new(); }
         hotkey.MaxEntries = Math.Clamp(hotkey.MaxEntries, 100, 5000);
         hotkey.MaxMegabytes = Math.Clamp(hotkey.MaxMegabytes, 40, 2048);
+        hotkey.RetentionHours = Math.Clamp(hotkey.RetentionHours, 1, 168);
+        tray.Text = hotkey.RecordingPaused ? "Clipboard History (paused)" : "Clipboard History";
 
         var header = new Panel { Dock = DockStyle.Top, Height = 68, Padding = new Padding(20) };
         header.Controls.Add(search);
@@ -101,6 +117,15 @@ internal sealed class ClipboardForm : Form
         Controls.Add(split); Controls.Add(footer); Controls.Add(header);
 
         var menu = new ContextMenuStrip();
+        var pause = menu.Items.Add(hotkey.RecordingPaused ? "Resume Recording" : "Pause Recording");
+        pause.Click += (_, _) => {
+            hotkey.RecordingPaused = !hotkey.RecordingPaused;
+            lastSequence = GetClipboardSequenceNumber();
+            pause.Text = hotkey.RecordingPaused ? "Resume Recording" : "Pause Recording";
+            tray.Text = hotkey.RecordingPaused ? "Clipboard History (paused)" : "Clipboard History";
+            SaveSettings();
+        };
+        menu.Items.Add("Privacy Settings…", null, (_, _) => ChangePrivacy());
         menu.Items.Add("Copy to Clipboard", null, (_, _) => CopySelected());
         menu.Items.Add("Clear History", null, (_, _) => ClearHistory());
         menu.Items.Add("Keyboard Shortcut…", null, (_, _) => ChangeShortcut());
@@ -160,11 +185,26 @@ internal sealed class ClipboardForm : Form
     }
     private void CaptureClipboard()
     {
+        if ((DateTime.UtcNow - lastPrune).TotalSeconds >= 30)
+        {
+            lastPrune = DateTime.UtcNow;
+            if (TrimHistory()) { SaveHistory(); RefreshList(); }
+        }
         var sequence = GetClipboardSequenceNumber();
         if (sequence == lastSequence) return;
         lastSequence = sequence;
+        if (hotkey.RecordingPaused) return;
         try
         {
+            if (Clipboard.ContainsData("ExcludeClipboardContentFromMonitorProcessing")) return;
+            if (Clipboard.ContainsData("CanIncludeInClipboardHistory"))
+            {
+                var flag = Clipboard.GetData("CanIncludeInClipboardHistory");
+                if (flag is int intFlag && intFlag == 0 || flag is uint uintFlag && uintFlag == 0) return;
+                if (flag is MemoryStream flagStream && flagStream.ToArray() is var flagData && flagData.Length >= 4 && BitConverter.ToUInt32(flagData, 0) == 0) return;
+                if (flag is byte[] flagBytes && flagBytes.Length >= 4 && BitConverter.ToUInt32(flagBytes, 0) == 0) return;
+            }
+            if (IsExcludedSource()) return;
             Entry? entry = null;
             if (Clipboard.ContainsImage())
             {
@@ -179,7 +219,7 @@ internal sealed class ClipboardForm : Form
             else if (Clipboard.ContainsText())
             {
                 var value = Clipboard.GetText();
-                if (value.Length > 0 && System.Text.Encoding.UTF8.GetByteCount(value) <= 1_000_000)
+                if (value.Length > 0 && System.Text.Encoding.UTF8.GetByteCount(value) <= 1_000_000 && !LooksSensitive(value))
                     entry = new Entry { Text = value };
             }
             if (entry is null) return;
@@ -268,6 +308,8 @@ internal sealed class ClipboardForm : Form
     private bool TrimHistory()
     {
         var before = entries.Count;
+        var cutoff = DateTime.UtcNow.AddHours(-hotkey.RetentionHours);
+        entries.RemoveAll(e => e.Created.ToUniversalTime() < cutoff || (e.Text is string text && LooksSensitive(text)));
         long Size() => entries.Sum(e => (long)(e.Image?.Length ?? System.Text.Encoding.UTF8.GetByteCount(e.Text ?? "")));
         while (entries.Count > hotkey.MaxEntries || Size() > hotkey.MaxMegabytes * 1_000_000L)
             entries.RemoveAt(entries.Count - 1);
@@ -321,7 +363,8 @@ internal sealed class ClipboardForm : Form
         UnregisterHotKey(Handle, HotkeyId);
         if (RegisterHotKey(Handle, HotkeyId, candidate.Modifiers, (uint)candidate.Key))
         {
-            hotkey = candidate;
+            hotkey.Key = candidate.Key;
+            hotkey.Modifiers = candidate.Modifiers;
             SaveSettings();
         }
         else
@@ -354,6 +397,42 @@ internal sealed class ClipboardForm : Form
     {
         Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
         File.WriteAllText(settingsPath, JsonSerializer.Serialize(hotkey));
+    }
+    private static bool LooksSensitive(string text)
+    {
+        try { return SensitiveContent.IsMatch(text); }
+        catch (RegexMatchTimeoutException) { return true; }
+    }
+    private bool IsExcludedSource()
+    {
+        var excluded = PasswordManagers.Concat(hotkey.ExcludedProcesses.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var window in new[] { GetClipboardOwner(), GetForegroundWindow() })
+        {
+            GetWindowThreadProcessId(window, out var pid);
+            if (pid == 0) continue;
+            try { using var process = Process.GetProcessById((int)pid); if (excluded.Contains(process.ProcessName)) return true; }
+            catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
+        }
+        return false;
+    }
+    private void ChangePrivacy()
+    {
+        using var dialog = new Form { Text = "Privacy Settings", Width = 440, Height = 260,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent };
+        var label = new Label { Text = "Retention in hours (1–168)", Left = 20, Top = 20, Width = 250 };
+        var hours = new NumericUpDown { Left = 300, Top = 18, Width = 90, Minimum = 1, Maximum = 168, Value = hotkey.RetentionHours };
+        var note = new Label { Text = "Extra excluded process names (comma-separated)", Left = 20, Top = 60, Width = 380 };
+        var excluded = new TextBox { Left = 20, Top = 85, Width = 375, Text = hotkey.ExcludedProcesses };
+        var warning = new Label { Text = "Password managers and marked private items are excluded. Unmarked passwords may still be recorded; pause before copying secrets.", Left = 20, Top = 118, Width = 375, Height = 42 };
+        var save = new Button { Text = "Save", Left = 230, Top = 170, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Left = 315, Top = 170, DialogResult = DialogResult.Cancel };
+        dialog.Controls.AddRange([label, hours, note, excluded, warning, save, cancel]);
+        dialog.AcceptButton = save; dialog.CancelButton = cancel;
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        hotkey.RetentionHours = (int)hours.Value;
+        hotkey.ExcludedProcesses = excluded.Text;
+        TrimHistory(); SaveHistory(); SaveSettings(); RefreshList();
     }
     private void Quit() { quitting = true; timer.Stop(); tray.Visible = false; Close(); }
 }

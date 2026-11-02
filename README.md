@@ -16,6 +16,14 @@ A lightweight, open-source clipboard manager for macOS and Windows. It keeps up 
 
 Clipboard history can contain passwords and other private information. Clear it from **Actions → Clear History** when needed.
 
+## Privacy controls
+
+History expires after **24 hours** by default, in addition to the entry and storage limits. **Actions → Privacy Settings…** lets you set retention from 1 to 168 hours and add excluded apps (bundle IDs on macOS; process names without `.exe` on Windows). Expired entries and recognizable secrets in existing history are removed on startup and during use.
+
+**Actions → Pause Recording** temporarily stops new captures and stays paused after a restart. Common password-manager apps and clipboard items marked private are excluded. Private-key blocks, common token formats, and authorization headers are also filtered. These checks cannot recognize every secret: pause recording before copying unmarked passwords or other sensitive data. Text inside screenshots is not inspected.
+
+The app stores history locally without application-level encryption. macOS files are restricted to the current user; full-disk encryption protects the disk when it is locked, but other software running as your user may still read history. Copies of the history made outside this app are not expired automatically.
+
 ## macOS
 
 Press `⌘⇧Space` to open the history. Use `↑` and `↓` to select an entry, then press `Enter` to paste. `Esc` or the red window button hides the app. Open **Actions → Keyboard Shortcut…** to record a different global shortcut. The new shortcut must include `⌘`, `⌥`, or `⌃`. If another app already uses it, the old shortcut stays active.
