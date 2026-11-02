@@ -20,6 +20,17 @@ internal sealed class Entry
     }
 }
 
+internal sealed class HotkeySettings
+{
+    public Keys Key { get; set; } = Keys.Space;
+    public uint Modifiers { get; set; } = 0x0002 | 0x0004;
+    public int MaxEntries { get; set; } = 500;
+    public int MaxMegabytes { get; set; } = 250;
+    public string Display => ((Modifiers & 0x0002) != 0 ? "Ctrl+" : "")
+        + ((Modifiers & 0x0001) != 0 ? "Alt+" : "")
+        + ((Modifiers & 0x0004) != 0 ? "Shift+" : "") + Key;
+}
+
 internal static class Program
 {
     [STAThread]
@@ -46,6 +57,7 @@ internal sealed class ClipboardForm : Form
 
     private const int HotkeyId = 1;
     private readonly string store = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipboardHistory", "history.json");
+    private readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClipboardHistory", "settings.json");
     private readonly List<Entry> entries = [];
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 500 };
     private readonly TextBox search = new() { PlaceholderText = "Search in History…", Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, Font = new Font("Segoe UI", 17) };
@@ -58,6 +70,7 @@ internal sealed class ClipboardForm : Form
     private uint lastSequence;
     private IntPtr previousWindow;
     private bool quitting;
+    private HotkeySettings hotkey = new();
 
     public ClipboardForm()
     {
@@ -66,6 +79,13 @@ internal sealed class ClipboardForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(20, 22, 27); ForeColor = Color.White;
         KeyPreview = true; ShowInTaskbar = false;
+        try
+        {
+            if (File.Exists(settingsPath)) hotkey = JsonSerializer.Deserialize<HotkeySettings>(File.ReadAllText(settingsPath)) ?? new();
+        }
+        catch (Exception e) when (e is IOException or JsonException) { hotkey = new(); }
+        hotkey.MaxEntries = Math.Clamp(hotkey.MaxEntries, 100, 5000);
+        hotkey.MaxMegabytes = Math.Clamp(hotkey.MaxMegabytes, 40, 2048);
 
         var header = new Panel { Dock = DockStyle.Top, Height = 68, Padding = new Padding(20) };
         header.Controls.Add(search);
@@ -83,6 +103,8 @@ internal sealed class ClipboardForm : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add("Copy to Clipboard", null, (_, _) => CopySelected());
         menu.Items.Add("Clear History", null, (_, _) => ClearHistory());
+        menu.Items.Add("Keyboard Shortcut…", null, (_, _) => ChangeShortcut());
+        menu.Items.Add("History Limits…", null, (_, _) => ChangeHistoryLimits());
         menu.Items.Add("Start with Windows", null, (_, _) => ToggleStartup());
         menu.Items.Add("Quit", null, (_, _) => Quit());
         actions.Click += (_, _) => menu.Show(actions, 0, -menu.PreferredSize.Height);
@@ -107,8 +129,8 @@ internal sealed class ClipboardForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        if (!RegisterHotKey(Handle, HotkeyId, 0x0002 | 0x0004, (uint)Keys.Space))
-            tray.ShowBalloonTip(3000, "Clipboard History", "Ctrl+Shift+Space is already in use", ToolTipIcon.Warning);
+        if (!RegisterHotKey(Handle, HotkeyId, hotkey.Modifiers, (uint)hotkey.Key))
+            tray.ShowBalloonTip(3000, "Clipboard History", hotkey.Display + " is already in use", ToolTipIcon.Warning);
     }
     protected override void OnHandleDestroyed(EventArgs e)
     {
@@ -165,8 +187,7 @@ internal sealed class ClipboardForm : Form
             entry.Fingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
             entries.RemoveAll(e => e.Fingerprint == entry.Fingerprint && (e.Image is null) == (entry.Image is null));
             entries.Insert(0, entry);
-            while (entries.Count > 100 || entries.Sum(e => e.Image?.Length ?? System.Text.Encoding.UTF8.GetByteCount(e.Text ?? "")) > 40_000_000)
-                entries.RemoveAt(entries.Count - 1);
+            TrimHistory();
             SaveHistory(); RefreshList();
         }
         catch (System.Runtime.InteropServices.ExternalException) { /* Clipboard held by another app. */ }
@@ -236,9 +257,21 @@ internal sealed class ClipboardForm : Form
     }
     private void LoadHistory()
     {
-        try { if (File.Exists(store)) entries.AddRange(JsonSerializer.Deserialize<List<Entry>>(File.ReadAllText(store)) ?? []); }
+        try
+        {
+            if (File.Exists(store)) entries.AddRange(JsonSerializer.Deserialize<List<Entry>>(File.ReadAllText(store)) ?? []);
+            if (TrimHistory()) SaveHistory();
+        }
         catch (Exception e) when (e is IOException or JsonException) { MessageBox.Show("History could not be loaded: " + e.Message); }
         RefreshList();
+    }
+    private bool TrimHistory()
+    {
+        var before = entries.Count;
+        long Size() => entries.Sum(e => (long)(e.Image?.Length ?? System.Text.Encoding.UTF8.GetByteCount(e.Text ?? "")));
+        while (entries.Count > hotkey.MaxEntries || Size() > hotkey.MaxMegabytes * 1_000_000L)
+            entries.RemoveAt(entries.Count - 1);
+        return before != entries.Count;
     }
     private void SaveHistory()
     {
@@ -257,6 +290,70 @@ internal sealed class ClipboardForm : Form
         if (key?.GetValue("ClipboardHistory") is null)
             key?.SetValue("ClipboardHistory", $"\"{Application.ExecutablePath}\"");
         else key.DeleteValue("ClipboardHistory");
+    }
+    private void ChangeShortcut()
+    {
+        using var dialog = new Form {
+            Text = "Keyboard Shortcut", Width = 380, Height = 190,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent, BackColor = BackColor, ForeColor = ForeColor
+        };
+        var prompt = new Label { Text = "Press a combination with Ctrl or Alt", Left = 20, Top = 18, Width = 330 };
+        var input = new TextBox { Left = 20, Top = 48, Width = 325, ReadOnly = true, Text = hotkey.Display };
+        var save = new Button { Text = "Save", Left = 182, Top = 94, Width = 78, Enabled = false, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Left = 267, Top = 94, Width = 78, DialogResult = DialogResult.Cancel };
+        HotkeySettings? candidate = null;
+        input.KeyDown += (_, e) => {
+            e.SuppressKeyPress = true;
+            if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu) return;
+            if (!e.Control && !e.Alt) return;
+            candidate = new HotkeySettings {
+                Key = e.KeyCode,
+                Modifiers = (e.Control ? 0x0002u : 0) | (e.Alt ? 0x0001u : 0) | (e.Shift ? 0x0004u : 0)
+            };
+            input.Text = candidate.Display;
+            save.Enabled = true;
+        };
+        dialog.Controls.AddRange([prompt, input, save, cancel]);
+        dialog.AcceptButton = save; dialog.CancelButton = cancel;
+        dialog.Shown += (_, _) => input.Focus();
+        if (dialog.ShowDialog(this) != DialogResult.OK || candidate is null) return;
+        UnregisterHotKey(Handle, HotkeyId);
+        if (RegisterHotKey(Handle, HotkeyId, candidate.Modifiers, (uint)candidate.Key))
+        {
+            hotkey = candidate;
+            SaveSettings();
+        }
+        else
+        {
+            RegisterHotKey(Handle, HotkeyId, hotkey.Modifiers, (uint)hotkey.Key);
+            MessageBox.Show(dialog, candidate.Display + " is already in use. The previous shortcut is still active.");
+        }
+    }
+    private void ChangeHistoryLimits()
+    {
+        using var dialog = new Form {
+            Text = "History Limits", Width = 400, Height = 230,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent, BackColor = BackColor, ForeColor = ForeColor
+        };
+        var countLabel = new Label { Text = "Maximum entries (100–5000)", Left = 20, Top = 22, Width = 240 };
+        var count = new NumericUpDown { Left = 270, Top = 18, Width = 90, Minimum = 100, Maximum = 5000, Value = hotkey.MaxEntries };
+        var sizeLabel = new Label { Text = "Storage limit in MB (40–2048)", Left = 20, Top = 68, Width = 240 };
+        var size = new NumericUpDown { Left = 270, Top = 64, Width = 90, Minimum = 40, Maximum = 2048, Value = hotkey.MaxMegabytes };
+        var save = new Button { Text = "Save", Left = 190, Top = 125, Width = 78, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Left = 276, Top = 125, Width = 84, DialogResult = DialogResult.Cancel };
+        dialog.Controls.AddRange([countLabel, count, sizeLabel, size, save, cancel]);
+        dialog.AcceptButton = save; dialog.CancelButton = cancel;
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        hotkey.MaxEntries = (int)count.Value;
+        hotkey.MaxMegabytes = (int)size.Value;
+        TrimHistory(); SaveHistory(); SaveSettings(); RefreshList();
+    }
+    private void SaveSettings()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
+        File.WriteAllText(settingsPath, JsonSerializer.Serialize(hotkey));
     }
     private void Quit() { quitting = true; timer.Stop(); tray.Visible = false; Close(); }
 }

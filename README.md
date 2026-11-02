@@ -1,25 +1,58 @@
-# История буфера
+# Clipboard History
 
-Небольшое открытое приложение для macOS и Windows. Запоминает до 100 последних текстовых записей и изображений (до 40 МБ суммарно). История хранится только на устройстве. Версии используют отдельные системные хранилища и не синхронизируют записи.
+A lightweight, open-source clipboard manager for macOS and Windows. It keeps up to **500 entries or 250 MB** by default. Change either limit in **Actions → History Limits…**. Older entries are removed when a limit is reached. History stays on your device; the apps do not sync clipboard contents.
+
+![Clipboard History showing a searchable text history](docs/images/history-text.png)
+
+![Clipboard History previewing an image from the local history](docs/images/history-image.png)
+
+## Features
+
+- Search and browse recent text and images.
+- Paste a selected entry into the app you were using.
+- Choose a global shortcut and set how many entries and how much storage to keep.
+- Run from the macOS menu bar or Windows system tray.
+- Keep history local. No account or network connection is used.
+
+Clipboard history can contain passwords and other private information. Clear it from **Actions → Clear History** when needed.
 
 ## macOS
 
-История находится в `~/Library/Application Support/ClipboardHistory/history-v2.json`, а изображения — в соседней папке `images`. Доступ к ним ограничен текущим пользователем.
+Press `⌘⇧Space` to open the history. Use `↑` and `↓` to select an entry, then press `Enter` to paste. `Esc` or the red window button hides the app. Open **Actions → Keyboard Shortcut…** to record a different global shortcut. The new shortcut must include `⌘`, `⌥`, or `⌃`. If another app already uses it, the old shortcut stays active.
 
-Нажмите значок в строке меню или `⌘⇧Space`. В окне можно искать по тексту, фильтровать текст и изображения, просматривать выбранную запись. `↑`/`↓` меняют выделение, `Enter` или кнопка «Paste to …» вставляет запись в предыдущее приложение; двойной щелчок по строке делает то же самое. `Esc` или красная кнопка окна скрывает его, оставляя историю работающей. Внизу справа кнопка «Actions» (`⌘K`) открывает копирование, очистку истории и выход. Для прямой вставки macOS должна разрешить приложению доступ в «Системные настройки → Конфиденциальность и безопасность → Универсальный доступ». До выдачи этого разрешения выбранная запись копируется в буфер, и её можно вставить вручную через `⌘V`.
+Open **Actions → History Limits…** to set the entry limit (100–5000) and storage limit (40–2048 MB). The defaults are 500 entries and 250 MB. The history file and images live in `~/Library/Application Support/ClipboardHistory/`; file access is restricted to your macOS account.
 
-Автозапуск при входе настроен через `~/Library/LaunchAgents/local.artemiy.clipboardhistory.plist`. Для отключения: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/local.artemiy.clipboardhistory.plist`, затем удалите этот plist. Пароли и другие секреты, скопированные как обычный текст, тоже могут попасть в историю; используйте «Actions → Clear History» при необходимости. Содержимое буфера никуда не отправляется.
+Direct paste requires Accessibility permission for the app in **System Settings → Privacy & Security → Accessibility**. Without it, the selected entry is copied to the clipboard so you can paste with `⌘V`.
 
-Сборка: `./build.sh` (требуются Apple Command Line Tools). Запуск: `open build/ClipboardHistory.app`. Для выхода используйте кнопку в окне. Исходный код: `main.swift`; значок: `assets/icon.png`.
+Build with Apple Command Line Tools:
+
+```sh
+./build.sh
+open build/ClipboardHistory.app
+```
 
 ## Windows
 
-Windows-версия находится в `windows/`. Для сборки нужен [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) на Windows. Команда: `dotnet build windows/ClipboardHistory.Windows.csproj -c Release`. Для выпуска одного EXE: `dotnet publish windows/ClipboardHistory.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true`.
+The Windows app runs in the system tray. Press `Ctrl+Shift+Space` to open it. Use `↑` and `↓` to select an entry, then press `Enter` to paste. `Esc` hides the window. Choose **Actions → Keyboard Shortcut…** to record a different shortcut with `Ctrl` or `Alt`. If the shortcut is already taken, the previous one remains active.
 
-Иконка находится в `windows/icon.ico`. Для её пересборки на macOS запустите `./build.sh`, затем `python3 windows/make-ico.py`.
+Choose **Actions → History Limits…** to set the entry limit (100–5000) and storage limit (40–2048 MB). The defaults are 500 entries and 250 MB. The history and settings are stored in `%LOCALAPPDATA%\ClipboardHistory\`.
 
-После запуска приложение работает в системном трее. `Ctrl+Shift+Space` открывает поиск по истории; `↑`/`↓` выбирают запись; `Enter`, двойной щелчок или кнопка `Paste` вставляют её в предыдущее окно. `Esc` скрывает окно. В `Actions` доступны копирование, очистка истории, настройка автозапуска и выход. История находится в `%LOCALAPPDATA%\ClipboardHistory\history.json`. Она может содержать скопированные пароли; удалите её через `Clear History`, если нужно.
+Build with the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0):
 
-Windows-версия повторяет основные функции macOS: текст, изображения, поиск, прямая вставка, системный трей и глобальная клавиша. Внешний вид адаптирован под WinForms. Кроссплатформенная сборка на macOS проверяет код, но для проверки поведения трея, горячей клавиши и вставки нужен Windows.
+```powershell
+dotnet build windows/ClipboardHistory.Windows.csproj -c Release
+```
 
-Лицензия: MIT, см. `LICENSE`.
+To publish a standalone x64 executable:
+
+```powershell
+dotnet publish windows/ClipboardHistory.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+```
+
+## Build checks
+
+The macOS build runs a small serialization and icon self-check. GitHub Actions builds the Windows project on every push and pull request. The Windows UI still needs hands-on testing on Windows.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
