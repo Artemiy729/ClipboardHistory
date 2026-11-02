@@ -4,3 +4,4 @@ windows/bin/
 windows/obj/
 *.user
 .DS_Store
+local.artemiy.clipboardhistory.plist
