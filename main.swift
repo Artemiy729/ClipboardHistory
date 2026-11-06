@@ -2,8 +2,9 @@ import AppKit
 import Carbon
 import CryptoKit
 import SwiftUI
+import ServiceManagement
 
-private enum ClipKind: String, Codable, CaseIterable {
+enum ClipKind: String, Codable, CaseIterable {
     case text, image
     var title: String { self == .text ? "Text" : "Images" }
 }
@@ -108,7 +109,7 @@ private final class ShortcutRecorder: NSView {
     }
 }
 
-private struct Clip: Identifiable, Codable {
+struct Clip: Identifiable, Codable {
     var id = UUID()
     var kind: ClipKind
     var text: String?
@@ -117,6 +118,10 @@ private struct Clip: Identifiable, Codable {
     var imageBytes: Int?
     var created = Date()
     var fingerprint: String
+    var pinned: Bool?
+    var favorite: Bool?
+    var isPinned: Bool { pinned == true }
+    var isFavorite: Bool { favorite == true }
 
     var title: String {
         if kind == .image {
@@ -129,21 +134,59 @@ private struct Clip: Identifiable, Codable {
 
 private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
 
+func retainedClips(_ clips: [Clip], cutoff: Date, maxItems: Int, maxBytes: Int) -> [Clip] {
+    var result = clips.filter {
+        ($0.isPinned || $0.created >= cutoff) && !($0.text.map(ClipboardPrivacy.looksSensitive) ?? false)
+    }.sorted {
+        if $0.isPinned != $1.isPinned { return $0.isPinned }
+        return $0.created > $1.created
+    }
+    var bytes = result.reduce(0) { $0 + ($1.imageBytes ?? $1.imageData?.count ?? $1.text?.utf8.count ?? 0) }
+    while result.count > maxItems || bytes > maxBytes {
+        guard let removed = result.popLast() else { break }
+        bytes -= removed.imageBytes ?? removed.imageData?.count ?? removed.text?.utf8.count ?? 0
+    }
+    return result
+}
+
+// A focus request is asynchronous. Require stable focus and released physical keys
+// before sending exactly one paste; never retry the paste event itself.
+private struct PasteReadiness {
+    enum Decision { case wait, paste, stop }
+    private var readySince: TimeInterval?
+    private var finished = false
+
+    mutating func update(elapsed: TimeInterval, targetAlive: Bool,
+                         targetActive: Bool, keysReleased: Bool) -> Decision {
+        guard !finished else { return .stop }
+        guard targetAlive, elapsed < 1.5 else { finished = true; return .stop }
+        guard targetActive, keysReleased else { readySince = nil; return .wait }
+        if readySince == nil { readySince = elapsed }
+        guard elapsed - readySince! >= 0.06 else { return .wait }
+        finished = true
+        return .paste
+    }
+}
+
 @MainActor private final class ClipboardModel: ObservableObject {
     @Published var items: [Clip] = []
     @Published var query = ""
     @Published var filter: ClipKind? = nil
+    @Published var favoritesOnly = false
     @Published var selectedID: UUID?
     @Published var focusToken = 0
     @Published var pasteTargetName = "Previous app"
     @Published var showActions = false
+    @Published private(set) var storageError: String?
+    @Published private(set) var recoveryNotice: String?
     @Published private(set) var recordingPaused = UserDefaults.standard.bool(forKey: "recordingPaused")
     weak var controller: ClipboardApp?
     private var lastChangeCount = NSPasteboard.general.changeCount
-    private let storeURL: URL
-    private let imageDirectory: URL
-    private let legacyURL: URL
+    private var storage: HistoryStorage?
+    private let demo: Bool
+    private var savedItems: [Clip] = []
     private let imageCache = NSCache<NSString, NSImage>()
+    private let thumbnailCache = NSCache<NSString, NSImage>()
     private var limits = HistoryLimits.load()
     private(set) var retentionHours = min(168, max(1, UserDefaults.standard.object(forKey: "retentionHours") as? Int ?? 24))
     private(set) var extraExcludedApps = UserDefaults.standard.string(forKey: "excludedApps") ?? ""
@@ -152,16 +195,10 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
     private var maxBytes: Int { limits.megabytes * 1_000_000 }
 
     init(demo: Bool = false) {
-        let folder = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ClipboardHistory", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
-                                                  attributes: [.posixPermissions: 0o700])
-        storeURL = folder.appendingPathComponent("history-v2.json")
-        legacyURL = folder.appendingPathComponent("history.json")
-        imageDirectory = folder.appendingPathComponent("images", isDirectory: true)
-        try? FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true,
-                                                  attributes: [.posixPermissions: 0o700])
+        self.demo = demo
         imageCache.countLimit = 3
+        thumbnailCache.countLimit = 128
+        thumbnailCache.totalCostLimit = 16 * 1_024 * 1_024
         if demo {
             let examples = [
                 "Build a local-first clipboard history with keyboard shortcuts.",
@@ -175,6 +212,8 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
                      created: Date().addingTimeInterval(Double(-index * 240)),
                      fingerprint: "demo-\(index)")
             }
+            items[0].pinned = true
+            items[0].favorite = true
             if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
                let image = NSImage(contentsOf: iconURL),
                let data = image.tiffRepresentation {
@@ -184,34 +223,41 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
             selectedID = items.first?.id
             return
         }
-        if let data = try? Data(contentsOf: storeURL),
-           let saved = try? JSONDecoder().decode([Clip].self, from: data),
-           saved.allSatisfy({ $0.imageFile == nil ||
-               FileManager.default.fileExists(atPath: imageDirectory.appendingPathComponent($0.imageFile!).path) }) {
-            items = Array(saved.prefix(maxItems))
-        } else if let data = try? Data(contentsOf: legacyURL),
-                  let saved = try? JSONDecoder().decode([Clip].self, from: data) {
-            let migrated = Array(saved.prefix(maxItems)).map { migrate($0) }
-            if migrated.allSatisfy({ $0 != nil }) {
-                items = migrated.compactMap { $0 }
-                _ = save()
-            } else {
-                items = Array(saved.prefix(maxItems))
-                NSLog("ClipboardHistory: migration incomplete; keeping legacy history")
-            }
+        reloadStorage()
+    }
+
+    func reloadStorage() {
+        guard !demo else { return }
+        storage = nil
+        imageCache.removeAllObjects()
+        thumbnailCache.removeAllObjects()
+        lastChangeCount = NSPasteboard.general.changeCount
+        do {
+            let folder = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/ClipboardHistory", isDirectory: true)
+            let store = try HistoryStorage(folder: folder)
+            let loaded = try store.load()
+            storage = store
+            storageError = nil
+            recoveryNotice = loaded.skippedImages > 0
+                ? "Recovered history. Skipped \(loaded.skippedImages) missing or damaged image(s)." : nil
+            items = loaded.clips
+            savedItems = items
+            trimToLimits()
+            _ = save()
+            selectedID = visible.first?.id
+        } catch {
+            storage = nil
+            items = []; savedItems = []; selectedID = nil
+            imageCache.removeAllObjects()
+            storageError = "Recording stopped. " + error.localizedDescription
         }
-        let originalCount = items.count
-        let originalFiles = Set(items.compactMap(\.imageFile))
-        trimToLimits()
-        if items.count != originalCount, save() {
-            removeFiles(originalFiles.subtracting(Set(items.compactMap(\.imageFile))))
-        }
-        selectedID = items.first?.id
     }
 
     var visible: [Clip] {
         items.filter { clip in
             (filter == nil || clip.kind == filter) &&
+            (!favoritesOnly || clip.isFavorite) &&
             (query.isEmpty || clip.title.localizedCaseInsensitiveContains(query) ||
              (clip.text?.localizedCaseInsensitiveContains(query) ?? false))
         }
@@ -221,7 +267,9 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
     var historyLimits: HistoryLimits { limits }
 
     func capture() {
+        guard !demo, storageError == nil, storage != nil else { return }
         pruneExpired()
+        guard storageError == nil else { return }
         let board = NSPasteboard.general
         guard board.changeCount != lastChangeCount else { return }
         lastChangeCount = board.changeCount
@@ -252,38 +300,81 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
     }
 
     private func add(_ clip: Clip) {
-        guard let stored = migrate(clip) else { return }
-        let oldFiles = Set(items.compactMap(\.imageFile))
+        var candidate = clip
+        if let previous = items.first(where: { $0.fingerprint == clip.fingerprint && $0.kind == clip.kind }) {
+            candidate = previous
+            candidate.created = clip.created
+        }
+        guard let stored = migrate(candidate) else { return }
         items.removeAll { $0.fingerprint == stored.fingerprint && $0.kind == stored.kind }
         items.insert(stored, at: 0)
         trimToLimits()
         selectedID = items.contains(where: { $0.id == stored.id }) ? stored.id : items.first?.id
-        if save() { removeFiles(oldFiles.subtracting(Set(items.compactMap(\.imageFile)))) }
+        _ = save()
     }
 
-    func useSelected() {
+    func useSelected(plainText: Bool = false) {
+        guard !demo else { return }
         guard selected != nil else { return }
-        copySelected()
+        guard copySelected(plainText: plainText) else { return }
         controller?.pasteAndHide()
     }
 
-    func copySelected() {
-        guard let clip = selected else { return }
+    @discardableResult func copySelected(plainText: Bool = false) -> Bool {
+        guard !demo else { return false }
+        guard let clip = selected else { return false }
+        guard !plainText || clip.kind == .text else { return false }
+        let object: NSPasteboardWriting
+        if clip.kind == .text, let text = clip.text {
+            object = text as NSString
+        } else if let image = image(for: clip) {
+            object = image
+        } else {
+            controller?.showMessage("Could not copy entry", detail: "The saved image could not be loaded. Your clipboard has not been changed.")
+            return false
+        }
         let board = NSPasteboard.general
         board.clearContents()
-        if clip.kind == .text, let text = clip.text {
-            board.setString(text, forType: .string)
-        } else if let image = image(for: clip) {
-            board.writeObjects([image])
-        }
+        let copied = board.writeObjects([object])
         lastChangeCount = board.changeCount
+        if !copied { controller?.showMessage("Could not copy entry", detail: "The clipboard is unavailable. Please try again.") }
+        return copied
     }
 
     func clear() {
-        let oldFiles = Set(items.compactMap(\.imageFile))
+        guard storageError == nil else { return }
         items.removeAll(); selectedID = nil
-        if save() { removeFiles(oldFiles) }
+        _ = save()
         imageCache.removeAllObjects()
+        thumbnailCache.removeAllObjects()
+    }
+
+    func togglePin(_ id: UUID) {
+        guard storageError == nil else { return }
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].pinned = !items[index].isPinned
+        trimToLimits()
+        _ = save()
+    }
+
+    func toggleFavorite(_ id: UUID) {
+        guard storageError == nil else { return }
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].favorite = !items[index].isFavorite
+        _ = save()
+        if !visible.contains(where: { $0.id == selectedID }) { selectedID = visible.first?.id }
+    }
+
+    func delete(_ id: UUID) {
+        guard storageError == nil else { return }
+        let index = visible.firstIndex { $0.id == id } ?? 0
+        items.removeAll { $0.id == id }
+        if save() {
+            let remaining = visible
+            selectedID = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id
+            imageCache.removeAllObjects()
+            thumbnailCache.removeObject(forKey: id.uuidString as NSString)
+        }
     }
 
     func toggleRecording() {
@@ -304,11 +395,10 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
         guard force || Date().timeIntervalSince(lastPrune) >= 30 else { return }
         lastPrune = Date()
         let count = items.count
-        let files = Set(items.compactMap(\.imageFile))
         trimToLimits()
         if items.count != count, save() {
-            removeFiles(files.subtracting(Set(items.compactMap(\.imageFile))))
             imageCache.removeAllObjects()
+            thumbnailCache.removeAllObjects()
         }
     }
 
@@ -316,54 +406,52 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
         limits = HistoryLimits(entries: min(5000, max(100, entries)),
                                megabytes: min(2048, max(40, megabytes)))
         UserDefaults.standard.set(try? JSONEncoder().encode(limits), forKey: "historyLimits")
-        let oldFiles = Set(items.compactMap(\.imageFile))
+        guard storageError == nil else { return }
         trimToLimits()
-        if save() { removeFiles(oldFiles.subtracting(Set(items.compactMap(\.imageFile)))) }
+        _ = save()
     }
 
     private func trimToLimits() {
         let cutoff = Date().addingTimeInterval(-Double(retentionHours) * 3600)
-        items.removeAll { $0.created < cutoff || ($0.text.map(ClipboardPrivacy.looksSensitive) ?? false) }
-        while items.count > maxItems ||
-              items.reduce(0, { $0 + ($1.imageBytes ?? $1.imageData?.count ?? $1.text?.utf8.count ?? 0) }) > maxBytes {
-            items.removeLast()
-        }
+        items = retainedClips(items, cutoff: cutoff, maxItems: maxItems, maxBytes: maxBytes)
         if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
     }
 
     func image(for clip: Clip) -> NSImage? {
         guard let name = clip.imageFile else { return clip.imageData.flatMap(NSImage.init(data:)) }
         if let cached = imageCache.object(forKey: name as NSString) { return cached }
-        guard let image = NSImage(contentsOf: imageDirectory.appendingPathComponent(name)) else { return nil }
+        guard let data = try? storage?.imageData(for: clip), let image = NSImage(data: data) else { return nil }
         imageCache.setObject(image, forKey: name as NSString)
         return image
     }
 
-    private func migrate(_ clip: Clip) -> Clip? {
-        guard clip.kind == .image, let data = clip.imageData else { return clip }
-        let isPNG = data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10])
-        let png = isPNG ? data : NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
-        let storedData = png ?? data
-        let name = clip.id.uuidString + (png == nil ? ".tiff" : ".png")
-        let path = imageDirectory.appendingPathComponent(name)
-        do {
-            try storedData.write(to: path, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
-        } catch {
-            NSLog("ClipboardHistory: image save error %@", String(describing: error))
-            return nil
-        }
-        var result = clip
-        result.imageData = nil
-        result.imageFile = name
-        result.imageBytes = storedData.count
-        return result
+    func thumbnail(for clip: Clip) async -> NSImage? {
+        let key = clip.id.uuidString as NSString
+        if let cached = thumbnailCache.object(forKey: key) { return cached }
+        let reader: @Sendable () throws -> Data
+        if let data = clip.imageData { reader = { data } }
+        else if let storage, let encryptedReader = try? storage.imageReader(for: clip) { reader = encryptedReader }
+        else { return nil }
+        guard let data = await ThumbnailRenderer.shared.render(read: reader), !Task.isCancelled,
+              items.contains(where: { $0.id == clip.id }), let image = NSImage(data: data) else { return nil }
+        thumbnailCache.setObject(image, forKey: key, cost: 112 * 112 * 4)
+        return image
     }
 
-    private func removeFiles(_ names: Set<String>) {
-        for name in names { try? FileManager.default.removeItem(at: imageDirectory.appendingPathComponent(name)) }
+    private func migrate(_ clip: Clip) -> Clip? {
+        do {
+            guard let storage else { return nil }
+            return try storage.storeImage(clip)
+        } catch {
+            storageError = "Recording stopped. Could not encrypt and save the image. " + error.localizedDescription
+            return nil
+        }
     }
-    func resetSearch() { query = ""; filter = nil; selectedID = items.first?.id; focusToken += 1 }
+
+    func resetSearch() {
+        query = ""; filter = nil; favoritesOnly = false
+        selectedID = items.first?.id; focusToken += 1
+    }
 
     func moveSelection(_ offset: Int) {
         let list = visible
@@ -373,15 +461,19 @@ private func isDemoMode() -> Bool { CommandLine.arguments.contains("--demo") }
     }
 
     @discardableResult private func save() -> Bool {
+        if demo { return true }
+        guard let storage, storageError == nil else {
+            items = savedItems
+            return false
+        }
         do {
-            try JSONEncoder().encode(items).write(to: storeURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
-            if FileManager.default.fileExists(atPath: legacyURL.path) {
-                try? FileManager.default.removeItem(at: legacyURL)
-            }
+            try storage.save(items)
+            savedItems = items
             return true
         } catch {
-            NSLog("ClipboardHistory: save error %@", String(describing: error))
+            items = savedItems
+            selectedID = visible.first?.id
+            storageError = "Recording stopped. Could not encrypt and save history. " + error.localizedDescription
             return false
         }
     }
@@ -409,8 +501,22 @@ private struct ClipboardView: View {
                     Text("Text").tag(ClipKind?.some(.text))
                     Text("Images").tag(ClipKind?.some(.image))
                 }.pickerStyle(.menu).frame(width: 180)
+                Button { model.favoritesOnly.toggle(); model.selectedID = model.visible.first?.id } label: {
+                    Image(systemName: model.favoritesOnly ? "star.fill" : "star")
+                        .foregroundStyle(model.favoritesOnly ? .yellow : .white.opacity(0.65))
+                }.buttonStyle(.plain).help("Show favorites")
             }.padding(.horizontal, 24).frame(height: 78)
 
+            if let message = model.storageError ?? model.recoveryNotice {
+                HStack {
+                    Image(systemName: model.storageError == nil ? "exclamationmark.triangle" : "lock.trianglebadge.exclamationmark")
+                    Text(message).font(.system(size: 13))
+                    Spacer()
+                    if model.storageError != nil {
+                        Button("Retry Unlock") { model.reloadStorage() }
+                    }
+                }.foregroundStyle(.orange).padding(12)
+            }
             Rectangle().fill(line).frame(height: 1)
 
             HStack(spacing: 0) {
@@ -422,14 +528,29 @@ private struct ClipboardView: View {
                                     model.selectedID = clip.id
                                     searchFocused = true
                                 } label: {
-                                    HStack(spacing: 14) {
-                                        Image(systemName: clip.kind == .text ? "doc.text" : "photo")
-                                            .font(.system(size: 20)).frame(width: 27)
-                                        Text(clip.title).lineLimit(1).font(.system(size: 17, weight: .medium))
-                                        Spacer(minLength: 0)
+                                    HStack(spacing: 12) {
+                                        HistoryThumbnail(model: model, clip: clip)
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text(clip.kind == .image ? "Image" : clip.title)
+                                                .font(.system(size: 14, weight: .medium))
+                                                .lineLimit(2).multilineTextAlignment(.leading)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                            HStack(spacing: 6) {
+                                                Text(clip.created.formatted(date: .omitted, time: .shortened))
+                                                Text("·")
+                                                if clip.kind == .text { Text("\(clip.text?.count ?? 0) chars") }
+                                                else if let bytes = clip.imageBytes ?? clip.imageData?.count {
+                                                    Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                                                } else { Text("Image") }
+                                            }.font(.system(size: 11)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
+                                        }
+                                        VStack(spacing: 8) {
+                                            if clip.isPinned { Image(systemName: "pin.fill") }
+                                            if clip.isFavorite { Image(systemName: "star.fill").foregroundStyle(.yellow) }
+                                        }.font(.system(size: 10)).frame(width: 12)
                                     }
                                     .foregroundStyle(.white.opacity(0.92))
-                                    .padding(.horizontal, 16).frame(height: 55)
+                                    .padding(.horizontal, 12).frame(height: 78)
                                     .background(model.selected?.id == clip.id ? accent.opacity(0.24) : Color.clear)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                 }
@@ -437,6 +558,17 @@ private struct ClipboardView: View {
                                 .simultaneousGesture(TapGesture(count: 2).onEnded {
                                     model.selectedID = clip.id; model.useSelected()
                                 })
+                                .contextMenu {
+                                    Button(clip.isPinned ? "Unpin" : "Pin") { model.togglePin(clip.id) }
+                                    Button(clip.isFavorite ? "Remove from Favorites" : "Add to Favorites") { model.toggleFavorite(clip.id) }
+                                    if clip.kind == .text {
+                                        Button("Paste as Plain Text") {
+                                            model.selectedID = clip.id; model.useSelected(plainText: true)
+                                        }
+                                    }
+                                    Divider()
+                                    Button("Delete Entry", role: .destructive) { model.delete(clip.id) }
+                                }
                                 .id(clip.id)
                             }
                         }.padding(12)
@@ -451,6 +583,19 @@ private struct ClipboardView: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     if let clip = model.selected {
+                        HStack(spacing: 18) {
+                            Button { model.togglePin(clip.id) } label: {
+                                Label(clip.isPinned ? "Unpin" : "Pin", systemImage: clip.isPinned ? "pin.fill" : "pin")
+                            }
+                            Button { model.toggleFavorite(clip.id) } label: {
+                                Label(clip.isFavorite ? "Unfavorite" : "Favorite", systemImage: clip.isFavorite ? "star.fill" : "star")
+                            }
+                            Spacer()
+                            Button(role: .destructive) { model.delete(clip.id) } label: {
+                                Image(systemName: "trash")
+                            }.help("Delete this entry")
+                        }.buttonStyle(.borderless).padding(16)
+                        Rectangle().fill(line).frame(height: 1)
                         ScrollView {
                             if clip.kind == .text {
                                 Text(clip.text ?? "").font(.system(size: 18, design: .monospaced))
@@ -472,8 +617,8 @@ private struct ClipboardView: View {
                             }
                         }.padding(20)
                     } else {
-                        ContentUnavailableView("History Empty", systemImage: "doc.on.clipboard",
-                                               description: Text("Copy text or an image"))
+                        ContentUnavailableView(model.storageError == nil ? "No Entries" : "History Locked", systemImage: "doc.on.clipboard",
+                                               description: Text(model.storageError == nil ? "Copy text or an image, or change your filters" : "Resolve the storage error above to resume recording"))
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).background(bg)
@@ -483,8 +628,8 @@ private struct ClipboardView: View {
 
             HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 29, height: 29)
-                Text(model.recordingPaused ? "Recording Paused" : "Clipboard History")
-                    .foregroundStyle(model.recordingPaused ? .orange : .white.opacity(0.65)).fontWeight(.medium)
+                Text(model.storageError != nil ? "History Locked" : (model.recordingPaused ? "Recording Paused" : "Encrypted History"))
+                    .foregroundStyle(model.recordingPaused || model.storageError != nil ? .orange : .white.opacity(0.65)).fontWeight(.medium)
                 Spacer()
                 Button { model.useSelected() } label: {
                     HStack(spacing: 10) {
@@ -512,8 +657,13 @@ private struct ClipboardView: View {
                             model.controller?.changePrivacySettings()
                         }
                         action("Copy to Clipboard", systemImage: "doc.on.doc") {
-                            model.copySelected(); model.controller?.hide(); model.showActions = false
+                            model.showActions = false
+                            if model.copySelected() { model.controller?.hide() }
                         }
+                        action("Paste as Plain Text · ⌘⇧V", systemImage: "textformat") {
+                            model.showActions = false
+                            model.useSelected(plainText: true)
+                        }.disabled(model.selected?.kind != .text)
                         action("Clear History", systemImage: "trash") {
                             model.clear(); model.showActions = false
                         }
@@ -525,10 +675,14 @@ private struct ClipboardView: View {
                             model.showActions = false
                             model.controller?.changeHistoryLimits()
                         }
+                        action("Startup & Permissions…", systemImage: "gearshape") {
+                            model.showActions = false
+                            model.controller?.showSettings()
+                        }
                         Divider()
                         action("Quit", systemImage: "power") { NSApp.terminate(nil) }
                     }
-                    .padding(10).frame(width: 220)
+                    .padding(10).frame(width: 280)
                     .preferredColorScheme(.dark)
                 }
             }.padding(.horizontal, 20).frame(height: 58).background(side)
@@ -564,6 +718,31 @@ private struct ClipboardView: View {
     }
 }
 
+private struct HistoryThumbnail: View {
+    @ObservedObject var model: ClipboardModel
+    let clip: Clip
+    @State private var thumbnail: NSImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.055))
+            if clip.kind == .text {
+                Text("Aa").font(.system(size: 17, weight: .medium, design: .serif))
+                    .foregroundStyle(.white.opacity(0.5))
+            } else if let thumbnail {
+                Image(nsImage: thumbnail).resizable().scaledToFit().padding(3)
+            } else {
+                Image(systemName: "photo").font(.system(size: 16)).foregroundStyle(.white.opacity(0.3))
+            }
+        }
+        .frame(width: 52, height: 52).clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityLabel(clip.kind == .image ? "Image thumbnail" : "Text entry")
+        .task(id: clip.id) {
+            if clip.kind == .image { thumbnail = await model.thumbnail(for: clip) }
+        }
+    }
+}
+
 @MainActor private final class ClipboardApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = ClipboardModel(demo: isDemoMode())
     private var panel: NSPanel!
@@ -572,11 +751,24 @@ private struct ClipboardView: View {
     private var handler: EventHandlerRef?
     private var keyMonitor: Any?
     private var targetApp: NSRunningApplication?
+    private var activationObserver: NSObjectProtocol?
+    private var pasteTask: Task<Void, Never>?
     private var shortcut = GlobalShortcut.load()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         model.controller = self
+        rememberTarget(NSWorkspace.shared.frontmostApplication)
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            MainActor.assumeIsolated {
+                // Keep the original destination while the picker or a settings alert is open.
+                guard let self, !self.panel.isVisible else { return }
+                self.rememberTarget(app)
+            }
+        }
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 660),
                         styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView, .resizable], backing: .buffered, defer: false)
         panel.contentView = NSHostingView(rootView: ClipboardView(model: model))
@@ -598,17 +790,25 @@ private struct ClipboardView: View {
             NSLog("ClipboardHistory: shortcut %@ unavailable", shortcut.label)
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.panel.isVisible,
-                  event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-                  event.charactersIgnoringModifiers?.lowercased() == "k" else { return event }
-            self.model.showActions.toggle()
-            return nil
+            guard let self, self.panel.isVisible else { return event }
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if modifiers == .command, event.keyCode == UInt16(kVK_ANSI_K) {
+                self.model.showActions.toggle()
+                return nil
+            }
+            if modifiers == [.command, .shift], event.keyCode == UInt16(kVK_ANSI_V) {
+                if !event.isARepeat { self.model.useSelected(plainText: true) }
+                return nil
+            }
+            return event
         }
 
         if !isDemoMode() {
-            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let captureTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.model.capture() }
             }
+            RunLoop.main.add(captureTimer, forMode: .common)
+            timer = captureTimer
         }
 
         if CommandLine.arguments.contains("--show") || isDemoMode() {
@@ -627,14 +827,22 @@ private struct ClipboardView: View {
                     model.selectedID = imageEntry.id
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                    self?.saveWindowScreenshot(to: URL(fileURLWithPath: path))
-                    NSApp.terminate(nil)
+                    guard let self else { return }
+                    self.model.query = ""
+                    self.model.filter = nil
+                    self.model.favoritesOnly = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.saveWindowScreenshot(to: URL(fileURLWithPath: path))
+                        NSApp.terminate(nil)
+                    }
                 }
             }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pasteTask?.cancel()
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
         timer?.invalidate()
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let handler { RemoveEventHandler(handler) }
@@ -651,34 +859,137 @@ private struct ClipboardView: View {
     }
 
     private func show() {
-        targetApp = NSWorkspace.shared.frontmostApplication
-        model.pasteTargetName = targetApp?.localizedName ?? "Previous app"
+        pasteTask?.cancel()
+        rememberTarget(NSWorkspace.shared.frontmostApplication)
+        if !isDemoMode() { model.capture() }
+        model.pasteTargetName = isDemoMode() ? "TextEdit" : (targetApp?.localizedName ?? "Previous app")
         model.resetSearch()
-        panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel.isVisible else { return }
+            self.panel.makeKeyAndOrderFront(nil)
+            self.model.focusToken += 1
+        }
+    }
+
+    private func rememberTarget(_ app: NSRunningApplication?) {
+        guard let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              !app.isTerminated, app.activationPolicy == .regular else { return }
+        targetApp = app
     }
 
     func hide() {
-        // Using orderOut ensures it hides in the dock/menu bar without killing the process immediately
+        pasteTask?.cancel()
+        model.showActions = false
         panel.orderOut(nil)
     }
 
+    func showMessage(_ title: String, detail: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.runModal()
+    }
+
+    func showSettings() {
+        let status = SMAppService.mainApp.status
+        let startup = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
+        startup.state = status == .enabled || status == .requiresApproval ? .on : .off
+        let startupStatus: String
+        switch status {
+        case .enabled: startupStatus = "Launch at login: enabled"
+        case .requiresApproval: startupStatus = "Launch at login: approval needed in System Settings"
+        case .notRegistered: startupStatus = "Launch at login: disabled"
+        case .notFound: startupStatus = "Launch at login: app unavailable — install the app in Applications"
+        @unknown default: startupStatus = "Launch at login: unknown"
+        }
+        let permission = AXIsProcessTrusted() ? "Accessibility: allowed" : "Accessibility: needed for automatic paste"
+        let encryption = model.storageError == nil ? "History: encrypted with AES-256-GCM" : "History: locked; recording stopped"
+        let stack = NSStackView(views: [
+            NSTextField(labelWithString: permission),
+            NSTextField(labelWithString: encryption),
+            NSTextField(wrappingLabelWithString: startupStatus), startup
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.frame = NSRect(x: 0, y: 0, width: 420, height: 130)
+        let alert = NSAlert()
+        alert.messageText = "Startup & Permissions"
+        alert.informativeText = "The encryption key is kept separately in your login Keychain. Allow Accessibility for automatic paste."
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Open Accessibility")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            return
+        }
+        guard response == .alertFirstButtonReturn else { return }
+        do {
+            if startup.state == .on {
+                if status != .enabled && status != .requiresApproval { try SMAppService.mainApp.register() }
+                if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+            } else if status == .enabled || status == .requiresApproval {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            showMessage("Could not change launch at login", detail: error.localizedDescription)
+        }
+    }
+
     func pasteAndHide() {
+        let target = targetApp
+        let changeCount = NSPasteboard.general.changeCount
+        hide()
         guard AXIsProcessTrusted() else {
+            showMessage("Entry copied — paste with ⌘V", detail: "To paste automatically next time, allow Clipboard History in System Settings → Privacy & Security → Accessibility.")
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
             return
         }
-        hide()
-        let target = targetApp
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            target?.activate(options: [])
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else { return }
-            down.flags = .maskCommand
-            up.flags = .maskCommand
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
+        guard let target, !target.isTerminated else {
+            showMessage("Entry copied — paste with ⌘V", detail: "The previous application is no longer available.")
+            return
+        }
+        target.activate(options: [])
+        pasteTask = Task { @MainActor [weak self] in
+            let started = ProcessInfo.processInfo.systemUptime
+            var readiness = PasteReadiness()
+            while !Task.isCancelled {
+                // Do not paste different content if another application changed the clipboard.
+                guard NSPasteboard.general.changeCount == changeCount else { return }
+                let flags = CGEventSource.flagsState(.combinedSessionState)
+                let modifiers: CGEventFlags = [.maskCommand, .maskShift, .maskAlternate, .maskControl]
+                let keysReleased = flags.intersection(modifiers).isEmpty &&
+                    ![kVK_Return, kVK_Space, kVK_ANSI_KeypadEnter].contains {
+                        CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0))
+                    }
+                switch readiness.update(elapsed: ProcessInfo.processInfo.systemUptime - started,
+                    targetAlive: !target.isTerminated,
+                    targetActive: NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
+                    keysReleased: keysReleased) {
+                case .wait:
+                    do { try await Task.sleep(nanoseconds: 20_000_000) } catch { return }
+                case .stop:
+                    self?.showMessage("Entry copied — paste with ⌘V", detail: "The destination did not become ready. Automatic paste was cancelled.")
+                    return
+                case .paste:
+                    guard let source = CGEventSource(stateID: .privateState),
+                          let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
+                          let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false) else {
+                        self?.showMessage("Entry copied — paste with ⌘V", detail: "Could not create the keyboard event.")
+                        return
+                    }
+                    down.flags = .maskCommand
+                    up.flags = .maskCommand
+                    down.post(tap: .cghidEventTap)
+                    up.post(tap: .cghidEventTap)
+                    return
+                }
+            }
         }
     }
 
@@ -796,6 +1107,42 @@ private struct ClipboardView: View {
 }
 
 if CommandLine.arguments.contains("--self-test") {
+    try runStorageTests()
+    MainActor.assumeIsolated {
+        let demo = ClipboardModel(demo: true)
+        let id = demo.items.first!.id
+        let count = demo.items.count
+        precondition(demo.items.first!.isPinned && demo.items.first!.isFavorite)
+        demo.favoritesOnly = true
+        precondition(demo.visible.map(\.id) == [id])
+        demo.toggleFavorite(id)
+        precondition(demo.visible.isEmpty && demo.selected == nil)
+        demo.toggleFavorite(id)
+        precondition(demo.selected?.id == id)
+        demo.togglePin(id)
+        precondition(!demo.items.first(where: { $0.id == id })!.isPinned)
+        demo.delete(id)
+        precondition(demo.items.count == count - 1 && demo.visible.isEmpty)
+        demo.resetSearch()
+        precondition(!demo.favoritesOnly && demo.selected != nil)
+        demo.clear()
+        precondition(demo.items.isEmpty && demo.selected == nil)
+    }
+    // Slow activation and a held shortcut must not send an early paste.
+    var readiness = PasteReadiness()
+    precondition(readiness.update(elapsed: 0, targetAlive: true, targetActive: false, keysReleased: false) == .wait)
+    precondition(readiness.update(elapsed: 0.4, targetAlive: true, targetActive: true, keysReleased: false) == .wait)
+    precondition(readiness.update(elapsed: 0.6, targetAlive: true, targetActive: true, keysReleased: true) == .wait)
+    // Losing focus resets the stability interval.
+    precondition(readiness.update(elapsed: 0.64, targetAlive: true, targetActive: false, keysReleased: true) == .wait)
+    precondition(readiness.update(elapsed: 0.7, targetAlive: true, targetActive: true, keysReleased: true) == .wait)
+    precondition(readiness.update(elapsed: 0.8, targetAlive: true, targetActive: true, keysReleased: true) == .paste)
+    precondition(readiness.update(elapsed: 0.9, targetAlive: true, targetActive: true, keysReleased: true) == .stop)
+    var timeout = PasteReadiness()
+    precondition(timeout.update(elapsed: 1.5, targetAlive: true, targetActive: true, keysReleased: true) == .stop)
+    precondition(timeout.update(elapsed: 1.6, targetAlive: true, targetActive: true, keysReleased: true) == .stop)
+    var terminated = PasteReadiness()
+    precondition(terminated.update(elapsed: 0, targetAlive: false, targetActive: false, keysReleased: true) == .stop)
     precondition(!ClipboardPrivacy.looksSensitive("A regular clipboard note"))
     precondition(ClipboardPrivacy.looksSensitive("Authorization: Bearer synthetic-test-value"))
     precondition(ClipboardPrivacy.looksSensitive("-----BEGIN PRIVATE KEY-----"))
@@ -819,6 +1166,12 @@ if CommandLine.arguments.contains("--self-test") {
 } else {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
+    if !isDemoMode(), let existing = NSRunningApplication.runningApplications(withBundleIdentifier: "local.artemiy.clipboardhistory")
+        .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated }) {
+        existing.activate(options: [])
+        print("ClipboardHistory is already running. Quit that copy before launching a new build.")
+        exit(0)
+    }
     let delegate = MainActor.assumeIsolated { ClipboardApp() }
     app.delegate = delegate
     app.run()

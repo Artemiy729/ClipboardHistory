@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
@@ -13,3 +16,29 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - run: dotnet build windows/ClipboardHistory.Windows.csproj -c Release
+      - name: Run Windows storage and preview checks
+        shell: pwsh
+        run: |
+          $test = Start-Process windows/bin/Release/net10.0-windows/ClipboardHistory.exe -ArgumentList '--self-test' -Wait -PassThru -NoNewWindow
+          if ($test.ExitCode -ne 0) { throw "Windows self-tests failed: $($test.ExitCode)" }
+      - name: Render demo preview
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $outputPath = Join-Path $PWD 'build/windows-preview.png'
+          $demo = Start-Process windows/bin/Release/net10.0-windows/ClipboardHistory.exe -ArgumentList '--demo', "--screenshot=$outputPath" -Wait -PassThru -NoNewWindow
+          if ($demo.ExitCode -ne 0 -or !(Test-Path $outputPath)) { throw 'Windows demo rendering failed' }
+      - run: dotnet publish windows/ClipboardHistory.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o build/windows-x64
+      - name: Package Windows app
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE build/windows-x64/LICENSE.txt
+          Compress-Archive -Path build/windows-x64/ClipboardHistory.exe,build/windows-x64/LICENSE.txt -DestinationPath build/ClipboardHistory-Windows-x64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Windows-x64
+          path: build/ClipboardHistory-Windows-x64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Windows-preview
+          path: build/windows-preview.png

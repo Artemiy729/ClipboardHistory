@@ -1,0 +1,23 @@
+name: macOS build and storage checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./build.sh
+        env:
+          CLIPBOARD_BUILD_ARCH: universal
+      - name: Package macOS app
+        run: ditto -c -k --sequesterRsrc --keepParent build/ClipboardHistory.app build/ClipboardHistory-macOS-universal.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macOS-universal
+          path: build/ClipboardHistory-macOS-universal.zip
